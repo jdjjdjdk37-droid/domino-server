@@ -1,11 +1,9 @@
 {
   "name": "domino-server",
-  "version": "5.0.0",
-  "description": "خادم لعبة الدومينو مع Agora + Firebase",
+  "version": "8.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -16,11 +14,10 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "helmet": "^7.0.0",
+    "express-rate-limit": "^7.1.5",
     "uuid": "^9.0.0",
     "firebase-admin": "^12.0.0",
-    "agora-access-token": "^2.0.4"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "agora-access-token": "^2.0.4",
+    "@supabase/supabase-js": "^2.39.0"
   }
 }
