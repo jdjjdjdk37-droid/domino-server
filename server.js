@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v5.5 (Yalla Ludo Style)
-// مع Agora (مكالمات صوتية) + Firebase + Friends & Invites + AI Fallback
+// خادم لعبة الدومينو - Railway Ready v8.0
+// Yalla Ludo Style + Supabase + Spectator + Agora
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -8,22 +8,58 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
+const { createClient } = require('@supabase/supabase-js');
 
-// استيراد Firebase
+// =========================================
+// Agora Configuration
+// =========================================
+const AGORA_APP_ID = process.env.AGORA_APP_ID || "d25d8dee0f8b487fb15bb4151a54057d";
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || "f245fe7746ff4591b303bf9799bb7968";
+
+console.log(`🎤 Agora App ID: ${AGORA_APP_ID.substring(0, 8)}...`);
+
+// =========================================
+// Supabase Configuration
+// =========================================
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "avatars";
+
+let supabaseAdmin = null;
+let supabaseReady = false;
+
+try {
+  if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
+    supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+      auth: { persistSession: false }
+    });
+    supabaseReady = true;
+    console.log('✅ Supabase Admin جاهز');
+  } else {
+    console.log('⚠️ Supabase غير مُهيأ');
+  }
+} catch (err) {
+  console.error('⚠️ Supabase معطّل:', err.message);
+}
+
+// =========================================
+// Firebase Admin
+// =========================================
 let admin = null;
 let db = null;
 let firebaseReady = false;
 
 try {
   admin = require('firebase-admin');
-  if (process.env.FIREBASE_PROJECT_ID && 
-      process.env.FIREBASE_CLIENT_EMAIL && 
+  if (process.env.FIREBASE_PROJECT_ID &&
+      process.env.FIREBASE_CLIENT_EMAIL &&
       process.env.FIREBASE_PRIVATE_KEY) {
-    
+
     admin.initializeApp({
       credential: admin.credential.cert({
         projectId: process.env.FIREBASE_PROJECT_ID,
@@ -31,7 +67,7 @@ try {
         privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
       }),
     });
-    
+
     db = admin.firestore();
     firebaseReady = true;
     console.log('✅ Firebase Admin جاهز');
@@ -42,14 +78,6 @@ try {
 
 // استيراد منطق اللعبة
 const { DominoGame } = require('./dominoGameLogic');
-
-// =========================================
-// Agora Configuration
-// =========================================
-const AGORA_APP_ID = process.env.AGORA_APP_ID || "d25d8dee0f8b487fb15bb4151a54057d";
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || "f245fe7746ff4591b303bf9799bb7968";
-
-console.log(`🎤 Agora App ID: ${AGORA_APP_ID.substring(0, 8)}...`);
 
 // =========================================
 // إعداد التطبيق
@@ -67,73 +95,248 @@ const io = new Server(server, {
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// خدمة ملفات APK
+// =========================================
+// Rate Limiting
+// =========================================
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  message: { error: "طلبات كثيرة جداً، حاول لاحقاً" },
+});
+
+app.use('/api/', apiLimiter);
 app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
 // =========================================
-// تخزين الغرف والمستخدمين المتصلين
+// تخزين الغرف
 // =========================================
 const rooms = new Map();
 const playerRooms = new Map();
-const onlineUsers = new Map(); // map userId/playerName -> socket.id
+const onlineUsers = new Map();
+const spectators = new Map(); // roomId → [{id, name}]
 
-// إعدادات
+const MAX_SPECTATORS_PER_ROOM = 50;
 const AI_TAKEOVER_DELAY = 30000;
 const TURN_TIMEOUT = 30000;
+const CHAT_TTL_HOURS = 24;
 
+// =========================================
+// Logging
+// =========================================
+function log(level, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${level}] ${timestamp} - ${message}`,
+    Object.keys(data).length ? JSON.stringify(data) : '');
+}
+
+// =========================================
 // OTA
+// =========================================
 const OTA_ENABLED = false;
 
 const LATEST_VERSION = {
-  versionCode: 4,
-  versionName: "2.4.0",
-  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.4.0.apk`,
-  changelog: "🎉 جديد:\n• نظام دعوة الأصدقاء اللحظي (Firebase & Sockets)\n• دعم نمط 2 ضد 2 للفرق\n• تحسين محاذاة الكاميرا والأحجار الأفعوانية\n• مكالمات صوتية عالية الدقة (Agora)",
+  versionCode: 5,
+  versionName: "2.5.0",
+  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.5.0.apk`,
+  changelog: "🎉 جديد:\n• نظام Spectator (مشاهدة المباريات)\n• Supabase Storage للأفاتار\n• Live Matches\n• المزيد",
   isMandatory: false,
-  releaseDate: "2026-09-16",
+  releaseDate: "2026-09-20",
   minSupportedVersion: 1,
 };
 
 // =========================================
-// 🎤 Agora Token Generator
+// 🎤 Agora Token
 // =========================================
 app.post('/api/agora/token', (req, res) => {
   try {
     const { roomId, uid } = req.body;
-    
+
     if (!roomId || !uid) {
       return res.status(400).json({ error: "roomId و uid مطلوبان" });
     }
 
-    const channelName = roomId;
-    const role = RtcRole.PUBLISHER;
-    const expirationTimeInSeconds = 3600;
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
     const token = RtcTokenBuilder.buildTokenWithUid(
       AGORA_APP_ID,
       AGORA_APP_CERTIFICATE,
-      channelName,
+      roomId,
       parseInt(uid),
-      role,
-      privilegeExpiredTs
+      RtcRole.PUBLISHER,
+      Math.floor(Date.now() / 1000) + 3600
     );
 
-    console.log(`🎤 Token Agora → Room: ${roomId}, UID: ${uid}`);
+    log('INFO', '🎤 Token Agora', { roomId, uid });
 
     res.json({
       token,
-      channel: channelName,
+      channel: roomId,
       uid: parseInt(uid),
       appId: AGORA_APP_ID,
-      expiresAt: privilegeExpiredTs,
     });
   } catch (err) {
-    console.error('❌ فشل توليد Token:', err.message);
+    log('ERROR', 'فشل توليد Token', { error: err.message });
     res.status(500).json({ error: "فشل توليد Token" });
+  }
+});
+
+// =========================================
+// ☁️ Supabase Upload URL
+// =========================================
+app.post('/api/supabase/upload-url', (req, res) => {
+  try {
+    const { userId, fileType } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId مطلوب" });
+    }
+
+    if (!supabaseReady) {
+      return res.status(503).json({ error: "Supabase غير متصل" });
+    }
+
+    const ext = fileType || 'jpg';
+    const fileName = `${userId}_${Date.now()}.${ext}`;
+    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${fileName}`;
+
+    log('INFO', '☁️ Upload URL', { userId, fileName });
+
+    res.json({
+      fileName,
+      bucket: SUPABASE_BUCKET,
+      publicUrl,
+      uploadUrl: `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${fileName}`,
+    });
+  } catch (err) {
+    log('ERROR', 'فشل إنشاء URL', { error: err.message });
+    res.status(500).json({ error: "فشل إنشاء URL" });
+  }
+});
+
+// =========================================
+// 👀 Live Matches
+// =========================================
+app.get('/api/live-matches', (req, res) => {
+  const list = [];
+  rooms.forEach((game, roomId) => {
+    if (game.gameStatus === "playing") {
+      const specList = spectators.get(roomId) || [];
+      list.push({
+        roomId,
+        mode: game.mode,
+        players: game.players.map(p => ({
+          name: p.name,
+          score: p.score,
+          avatar: p.avatar || null,
+        })),
+        spectators: specList.length,
+        startedAt: game.createdAt,
+        duration: Date.now() - game.createdAt,
+      });
+    }
+  });
+  res.json({ matches: list, count: list.length });
+});
+
+// =========================================
+// 👀 Room Spectators
+// =========================================
+app.get('/api/room/:roomId/spectators', (req, res) => {
+  const { roomId } = req.params;
+  const list = spectators.get(roomId) || [];
+  res.json({
+    count: list.length,
+    list,
+    max: MAX_SPECTATORS_PER_ROOM,
+  });
+});
+
+// =========================================
+// 📊 User APIs
+// =========================================
+app.get('/api/user/:userId/stats', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!firebaseReady) return res.status(503).json({ error: "Firebase غير متصل" });
+
+    const snapshot = await db.collection('users_stats')
+      .where('name', '==', userId).limit(1).get();
+
+    if (snapshot.empty) {
+      return res.json({
+        userId, wins: 0, losses: 0, winRate: 0,
+        longestStreak: 0, totalScore: 0, matches: 0,
+      });
+    }
+
+    const data = snapshot.docs[0].data();
+    const wins = data.wins || 0;
+    const losses = data.losses || 0;
+    const total = wins + losses;
+
+    res.json({
+      userId,
+      name: data.name,
+      avatarUrl: data.avatarUrl || null,
+      wins, losses,
+      winRate: total > 0 ? Math.round((wins / total) * 100) : 0,
+      longestStreak: data.longestStreak || 0,
+      currentStreak: data.currentStreak || 0,
+      totalScore: data.totalScore || 0,
+      matches: total,
+      achievements: data.achievements || [],
+    });
+  } catch (err) {
+    log('ERROR', 'فشل جلب الإحصائيات', { error: err.message });
+    res.status(500).json({ error: "فشل جلب الإحصائيات" });
+  }
+});
+
+app.get('/api/user/:userId/friends', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!firebaseReady) return res.status(503).json({ error: "Firebase غير متصل" });
+
+    const doc = await db.collection('friends').doc(userId).get();
+    if (!doc.exists) return res.json({ userId, friends: [] });
+
+    const data = doc.data();
+    const friends = (data.friends || []).map(f => ({
+      ...f,
+      isOnline: onlineUsers.has(f.friendName),
+    }));
+
+    res.json({ userId, friends, count: friends.length });
+  } catch (err) {
+    res.status(500).json({ error: "فشل جلب الأصدقاء" });
+  }
+});
+
+app.get('/api/user/:userId/matches', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    if (!firebaseReady) return res.status(503).json({ error: "Firebase غير متصل" });
+
+    const snapshot = await db.collection('matches')
+      .orderBy('finishedAt', 'desc').limit(100).get();
+
+    const matches = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      const isPlayer = data.players?.some(p => p.name === userId);
+      if (isPlayer && matches.length < limit) {
+        matches.push({
+          id: doc.id,
+          ...data,
+          finishedAt: data.finishedAt?.toDate?.()?.toISOString() || null,
+        });
+      }
+    });
+
+    res.json({ userId, matches, count: matches.length });
+  } catch (err) {
+    res.status(500).json({ error: "فشل جلب المباريات" });
   }
 });
 
@@ -144,17 +347,27 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
   const game = rooms.get(roomId);
   if (!game) return;
 
-  console.log(`🔒 إغلاق الغرفة ${roomId} - السبب: ${reason}`);
+  log('INFO', `🔒 إغلاق الغرفة`, { roomId, reason });
 
   game.players.forEach(p => {
     if (p.turnTimer) clearTimeout(p.turnTimer);
     if (p.aiTakeoverTimer) clearTimeout(p.aiTakeoverTimer);
   });
 
+  // 👀 إشعار المشاهدين
+  const specList = spectators.get(roomId) || [];
+  specList.forEach(s => {
+    io.to(s.id).emit('spectator_game_ended', {
+      roomId,
+      message: "انتهت المباراة",
+    });
+  });
+  spectators.delete(roomId);
+
   io.to(roomId).emit('room_closed', {
     roomId,
     reason,
-    message: reason
+    message: reason,
   });
 
   game.players.forEach(p => {
@@ -168,7 +381,7 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
   });
 
   rooms.delete(roomId);
-  console.log(`🗑️ تم حذف الغرفة ${roomId}`);
+  log('INFO', `🗑️ تم حذف الغرفة`, { roomId, remaining: rooms.size });
 }
 
 // =========================================
@@ -207,34 +420,55 @@ setInterval(() => {
 // =========================================
 // 🎯 Endpoints
 // =========================================
-
 app.get('/', (req, res) => {
   res.json({
     name: "🎲 Domino Server - Yalla Ludo Style",
     status: "online",
-    version: "5.5.0",
+    version: "8.0.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     onlineUsers: onlineUsers.size,
+    spectators: spectators.size,
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
     firebaseReady: firebaseReady,
+    supabaseReady: supabaseReady,
+    agoraEnabled: !!(AGORA_APP_ID && AGORA_APP_CERTIFICATE),
     aiFallbackEnabled: true,
-    agoraEnabled: true,
   });
 });
 
-app.get('/health', (req, res) => {
-  res.status(200).json({
+app.get('/health', async (req, res) => {
+  const start = Date.now();
+
+  let firebaseStatus = 'disconnected';
+  if (firebaseReady) {
+    try {
+      await db.collection('_health').limit(1).get();
+      firebaseStatus = 'connected';
+    } catch { firebaseStatus = 'error'; }
+  }
+
+  const memory = process.memoryUsage();
+
+  res.json({
     status: "healthy",
     timestamp: new Date().toISOString(),
-    rooms: rooms.size,
-    players: playerRooms.size,
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB",
-    uptime: Math.floor(process.uptime()) + "s",
-    otaEnabled: OTA_ENABLED,
-    firebaseReady: firebaseReady,
-    agoraEnabled: true,
+    responseTime: (Date.now() - start) + "ms",
+    services: {
+      firebase: firebaseStatus,
+      supabase: supabaseReady ? 'connected' : 'disconnected',
+      agora: (AGORA_APP_ID && AGORA_APP_CERTIFICATE) ? 'configured' : 'missing',
+    },
+    stats: {
+      rooms: rooms.size,
+      players: playerRooms.size,
+      onlineUsers: onlineUsers.size,
+      spectators: spectators.size,
+      memory: Math.round(memory.heapUsed / 1024 / 1024) + "MB",
+      uptime: Math.floor(process.uptime()) + "s",
+    },
+    version: "8.0.0",
   });
 });
 
@@ -254,9 +488,6 @@ app.get('/rooms', (req, res) => {
   res.json({ rooms: list, count: list.length });
 });
 
-// =========================================
-// 📡 Config
-// =========================================
 app.get('/api/config', (req, res) => {
   res.json({
     theme: {
@@ -272,6 +503,8 @@ app.get('/api/config', (req, res) => {
       chat: true,
       leaderboard: true,
       friendInvites: true,
+      spectator: true,
+      supabaseUploads: supabaseReady,
     },
     agora: {
       appId: AGORA_APP_ID,
@@ -294,14 +527,14 @@ app.get('/api/config', (req, res) => {
 // =========================================
 app.get('/api/check-update', (req, res) => {
   if (!OTA_ENABLED) {
-    return res.json({ 
+    return res.json({
       updateAvailable: false,
-      message: "لا يوجد تحديث حالياً"
+      message: "لا يوجد تحديث حالياً",
     });
   }
 
   const clientVersion = parseInt(req.query.versionCode) || 0;
-  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.4.0.apk');
+  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.5.0.apk');
 
   if (!fs.existsSync(apkPath)) {
     return res.json({ updateAvailable: false });
@@ -319,7 +552,7 @@ app.get('/api/check-update', (req, res) => {
 });
 
 // =========================================
-// 💾 Firebase دوال
+// 💾 Firebase Helpers
 // =========================================
 async function saveMatch(matchData) {
   if (!firebaseReady) return;
@@ -329,7 +562,7 @@ async function saveMatch(matchData) {
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (err) {
-    console.error('❌ حفظ المباراة:', err.message);
+    log('ERROR', 'حفظ المباراة', { error: err.message });
   }
 }
 
@@ -337,9 +570,7 @@ async function updateUserStats(playerName, won, score) {
   if (!firebaseReady) return;
   try {
     const snapshot = await db.collection('users_stats')
-      .where('name', '==', playerName)
-      .limit(1)
-      .get();
+      .where('name', '==', playerName).limit(1).get();
 
     if (snapshot.empty) {
       await db.collection('users_stats').add({
@@ -355,7 +586,7 @@ async function updateUserStats(playerName, won, score) {
       const doc = snapshot.docs[0];
       const data = doc.data();
       const newStreak = won ? (data.currentStreak || 0) + 1 : 0;
-      
+
       await doc.ref.update({
         wins: (data.wins || 0) + (won ? 1 : 0),
         losses: (data.losses || 0) + (won ? 0 : 1),
@@ -366,7 +597,7 @@ async function updateUserStats(playerName, won, score) {
       });
     }
   } catch (err) {
-    console.error('❌ تحديث الإحصائيات:', err.message);
+    log('ERROR', 'تحديث الإحصائيات', { error: err.message });
   }
 }
 
@@ -374,16 +605,14 @@ async function updateLeaderboard() {
   if (!firebaseReady) return;
   try {
     const snapshot = await db.collection('users_stats')
-      .orderBy('totalScore', 'desc')
-      .limit(100)
-      .get();
+      .orderBy('totalScore', 'desc').limit(100).get();
 
     const batch = db.batch();
     const leaderboardRef = db.collection('leaderboard');
-    
+
     const oldSnapshot = await leaderboardRef.get();
     oldSnapshot.docs.forEach(doc => batch.delete(doc.ref));
-    
+
     snapshot.docs.forEach((doc, index) => {
       const newRef = leaderboardRef.doc();
       batch.set(newRef, {
@@ -395,7 +624,7 @@ async function updateLeaderboard() {
 
     await batch.commit();
   } catch (err) {
-    console.error('❌ Leaderboard:', err.message);
+    log('ERROR', 'Leaderboard', { error: err.message });
   }
 }
 
@@ -406,14 +635,9 @@ function getAIMove(game, player) {
   if (!game || !player) return null;
 
   const validMoves = [];
-  
   player.hand.forEach(tile => {
-    if (game.canPlayTile(tile, "left")) {
-      validMoves.push({ tile, side: "left" });
-    }
-    if (game.canPlayTile(tile, "right")) {
-      validMoves.push({ tile, side: "right" });
-    }
+    if (game.canPlayTile(tile, "left")) validMoves.push({ tile, side: "left" });
+    if (game.canPlayTile(tile, "right")) validMoves.push({ tile, side: "right" });
   });
 
   if (validMoves.length === 0) return null;
@@ -435,9 +659,9 @@ function startAIFallback(roomId, playerId) {
   const player = game.players.find(p => p.id === playerId);
   if (!player) return;
 
-  console.log(`🤖 AI يبدأ لعب ${player.name}`);
+  log('INFO', `🤖 AI يبدأ`, { roomId, playerName: player.name });
   player.aiControlled = true;
-  
+
   io.to(roomId).emit('ai_took_over', {
     playerId,
     playerName: player.name,
@@ -458,10 +682,7 @@ function stopAIFallback(roomId, playerId) {
 
   if (player.aiControlled) {
     player.aiControlled = false;
-    io.to(roomId).emit('ai_stopped', {
-      playerId,
-      playerName: player.name,
-    });
+    io.to(roomId).emit('ai_stopped', { playerId, playerName: player.name });
   }
 
   if (player.aiTakeoverTimer) {
@@ -476,14 +697,12 @@ function makeAIMove(roomId, playerId) {
 
   const player = game.players.find(p => p.id === playerId);
   if (!player || !player.aiControlled) return;
-
   if (game.players[game.currentTurn]?.id !== playerId) return;
 
   const move = getAIMove(game, player);
-  
+
   if (move) {
     const result = game.playTile(playerId, move.tile, move.side);
-    
     if (!result.error) {
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
@@ -491,9 +710,7 @@ function makeAIMove(roomId, playerId) {
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
-        if (game.gameStatus === "finished") {
-          handleGameEnd(roomId);
-        }
+        if (game.gameStatus === "finished") handleGameEnd(roomId);
       }
     }
   } else {
@@ -505,7 +722,7 @@ function makeAIMove(roomId, playerId) {
         return;
       }
     }
-    
+
     const passResult = game.passTurn(playerId);
     if (!passResult.error) {
       game.players.forEach(p => {
@@ -530,32 +747,26 @@ function handleGameEnd(roomId) {
   if (!game) return;
 
   const winner = game.players.find(p => p.score >= game.maxScore);
-  
+
   io.to(roomId).emit('game_ended', {
     winner: winner?.name,
-    scores: game.players.map(p => ({ 
-      name: p.name, 
-      score: p.score 
-    })),
+    scores: game.players.map(p => ({ name: p.name, score: p.score })),
   });
 
   if (firebaseReady) {
     saveMatch({
       roomId,
       mode: game.mode,
-      players: game.players.map(p => ({ 
-        name: p.name, 
-        score: p.score 
-      })),
+      players: game.players.map(p => ({ name: p.name, score: p.score })),
       winner: winner?.name,
       duration: Date.now() - game.createdAt,
       createdAt: new Date(game.createdAt).toISOString(),
     });
-    
+
     game.players.forEach(p => {
       updateUserStats(p.name, p.id === winner?.id, p.score);
     });
-    
+
     updateLeaderboard();
   }
 
@@ -563,21 +774,48 @@ function handleGameEnd(roomId) {
 }
 
 // =========================================
+// 👀 إزالة مشاهد
+// =========================================
+function removeSpectator(socket, roomId) {
+  const list = spectators.get(roomId) || [];
+  const idx = list.findIndex(s => s.id === socket.id);
+
+  if (idx !== -1) list.splice(idx, 1);
+
+  if (list.length === 0) {
+    spectators.delete(roomId);
+  } else {
+    spectators.set(roomId, list);
+  }
+
+  socket.leave(roomId);
+  socket.isSpectator = false;
+  socket.spectateRoomId = null;
+
+  io.to(roomId).emit('spectator_left', {
+    spectatorId: socket.id,
+    totalSpectators: list.length,
+  });
+
+  log('INFO', `👀 مشاهد غادر`, { roomId, total: list.length });
+}
+
+// =========================================
 // 🔌 WebSocket
 // =========================================
 io.on('connection', (socket) => {
-  console.log(`✅ لاعب متصل: ${socket.id}`);
+  log('INFO', `✅ لاعب متصل`, { socketId: socket.id });
 
-  // تسجل اللاعب بحالته المتصلة
+  // تسجيل اللاعب
   socket.on('user_online', ({ userName }) => {
     if (userName) {
       onlineUsers.set(userName, socket.id);
       socket.userName = userName;
-      console.log(`👤 تسجيل دخول اللاعب: ${userName}`);
+      log('INFO', `👤 تسجيل دخول`, { userName });
     }
   });
 
-  // 📩 إرسال دعوة لصديق
+  // دعوة صديق
   socket.on('invite_friend', ({ targetUserName, roomId, mode }) => {
     const targetSocketId = onlineUsers.get(targetUserName);
     if (targetSocketId) {
@@ -585,37 +823,108 @@ io.on('connection', (socket) => {
         fromUser: socket.userName || "صديق",
         roomId,
         mode,
-        timestamp: Date.now()
+        timestamp: Date.now(),
       });
-      console.log(`📩 تم إرسال دعوة من ${socket.userName} إلى ${targetUserName}`);
     } else {
       socket.emit('invite_failed', { message: "الصديق غير متصل حالياً" });
     }
   });
 
-  // 🤝 الرد على الدعوة (قبول / رفض)
+  // الرد على الدعوة
   socket.on('respond_invite', ({ roomId, accept, inviterName }) => {
     const inviterSocketId = onlineUsers.get(inviterName);
     if (inviterSocketId) {
       io.to(inviterSocketId).emit('invite_response', {
         fromUser: socket.userName,
         accept,
-        roomId
+        roomId,
       });
     }
   });
 
+  // =========================================
+  // 👀 Spectator Events
+  // =========================================
+  socket.on('spectate_room', ({ roomId, spectatorName }, callback) => {
+    try {
+      const game = rooms.get(roomId);
+      if (!game) return callback?.({ error: "الغرفة غير موجودة" });
+      if (game.gameStatus === "finished") {
+        return callback?.({ error: "اللعبة انتهت" });
+      }
+
+      const currentSpecs = spectators.get(roomId) || [];
+      if (currentSpecs.length >= MAX_SPECTATORS_PER_ROOM) {
+        return callback?.({ error: "الغرفة ممتلئة بالمشاهدين" });
+      }
+
+      socket.join(roomId);
+      socket.isSpectator = true;
+      socket.spectatorName = spectatorName;
+      socket.spectateRoomId = roomId;
+
+      currentSpecs.push({ id: socket.id, name: spectatorName });
+      spectators.set(roomId, currentSpecs);
+
+      log('INFO', `👀 مشاهد انضم`, { roomId, name: spectatorName, total: currentSpecs.length });
+
+      socket.emit('game_state', game.getPublicState(null));
+
+      io.to(roomId).emit('spectator_joined', {
+        spectatorId: socket.id,
+        spectatorName,
+        totalSpectators: currentSpecs.length,
+      });
+
+      callback?.({ success: true, totalSpectators: currentSpecs.length });
+    } catch (err) {
+      log('ERROR', 'فشل انضمام المشاهد', { error: err.message });
+      callback?.({ error: "فشل الانضمام" });
+    }
+  });
+
+  socket.on('spectator_message', ({ roomId, text }) => {
+    if (!socket.isSpectator) return;
+    if (socket.spectateRoomId !== roomId) return;
+
+    io.to(roomId).emit('spectator_message', {
+      spectatorId: socket.id,
+      spectatorName: socket.spectatorName,
+      text: (text || "").substring(0, 100),
+      timestamp: Date.now(),
+    });
+  });
+
+  socket.on('spectator_emoji', ({ roomId, emoji }) => {
+    if (!socket.isSpectator) return;
+    if (socket.spectateRoomId !== roomId) return;
+
+    io.to(roomId).emit('spectator_emoji', {
+      spectatorId: socket.id,
+      spectatorName: socket.spectatorName,
+      emoji,
+      timestamp: Date.now(),
+    });
+  });
+
+  socket.on('leave_spectator', ({ roomId }) => {
+    removeSpectator(socket, roomId);
+  });
+
+  // =========================================
+  // 🎮 Game Events
+  // =========================================
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
       const roomId = uuidv4().slice(0, 6).toUpperCase();
       const game = new DominoGame(roomId, mode, socket.id, playerName);
       game.lastActivity = Date.now();
-      
+
       rooms.set(roomId, game);
       playerRooms.set(socket.id, roomId);
       socket.join(roomId);
 
-      console.log(`🏠 غرفة جديدة [${mode}]: ${roomId}`);
+      log('INFO', `🏠 غرفة جديدة`, { roomId, mode });
 
       callback({
         success: true,
@@ -646,7 +955,7 @@ io.on('connection', (socket) => {
 
       if (game.isFull() && game.gameStatus === "waiting") {
         game.startRound();
-        io.to(roomId).emit('game_started', { 
+        io.to(roomId).emit('game_started', {
           message: "🎲 بدأت اللعبة!",
           voiceChannel: roomId,
         });
@@ -674,9 +983,13 @@ io.on('connection', (socket) => {
       const result = game.playTile(socket.id, tile, side);
       if (result.error) return callback?.({ error: result.error });
 
+      // إرسال للاعبين
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
+
+      // 👀 إرسال للمشاهدين
+      socket.to(roomId).emit('game_state', game.getPublicState(null));
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
@@ -709,6 +1022,8 @@ io.on('connection', (socket) => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
 
+      socket.to(roomId).emit('game_state', game.getPublicState(null));
+
       callback?.({ success: true, tile: result.tile });
     } catch (err) {
       callback?.({ error: "فشل السحب" });
@@ -727,6 +1042,8 @@ io.on('connection', (socket) => {
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
+
+      socket.to(roomId).emit('game_state', game.getPublicState(null));
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
@@ -764,24 +1081,39 @@ io.on('connection', (socket) => {
     }
   });
 
-  // الدردشة المباشرة والإيموجيات
-  socket.on('send_message', ({ roomId, text, type = "text" }) => {
+  // الدردشة
+  socket.on('send_message', async ({ roomId, text, type = "text" }) => {
     const game = rooms.get(roomId);
     if (!game) return;
 
     const player = game.players.find(p => p.id === socket.id);
     if (!player) return;
 
-    io.to(roomId).emit('chat_message', {
+    const message = {
       playerId: socket.id,
       playerName: player.name,
       text: (text || "").substring(0, 100),
       type,
       timestamp: Date.now(),
-    });
+    };
+
+    io.to(roomId).emit('chat_message', message);
+
+    // حفظ في Firestore
+    if (firebaseReady) {
+      try {
+        await db.collection('chat_messages').add({
+          roomId,
+          ...message,
+          timestamp: new Date(message.timestamp),
+        });
+      } catch (err) {
+        log('ERROR', 'حفظ الرسالة', { error: err.message });
+      }
+    }
   });
 
-  // 🎤 إشعارات الصوت اللحظية (Speaking Waves)
+  // 🎤 إشعارات الصوت
   socket.on('voice_joined', ({ roomId }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -797,9 +1129,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('voice_left', ({ roomId }) => {
-    socket.to(roomId).emit('voice_user_left', {
-      playerId: socket.id,
-    });
+    socket.to(roomId).emit('voice_user_left', { playerId: socket.id });
   });
 
   socket.on('voice_muted', ({ roomId, muted }) => {
@@ -821,7 +1151,7 @@ io.on('connection', (socket) => {
     const game = rooms.get(roomId);
     if (!game) return callback?.({ error: "الغرفة غير موجودة" });
 
-    const oldPlayer = game.players.find(p => 
+    const oldPlayer = game.players.find(p =>
       p.name === playerName && !p.connected
     );
 
@@ -829,7 +1159,7 @@ io.on('connection', (socket) => {
 
     const oldId = oldPlayer.id;
     playerRooms.delete(oldId);
-    
+
     oldPlayer.id = socket.id;
     oldPlayer.connected = true;
     playerRooms.set(socket.id, roomId);
@@ -843,10 +1173,7 @@ io.on('connection', (socket) => {
       playerName,
     });
 
-    callback?.({
-      success: true,
-      game: game.getPublicState(socket.id),
-    });
+    callback?.({ success: true, game: game.getPublicState(socket.id) });
   });
 
   socket.on('leave_room', ({ roomId }) => {
@@ -854,7 +1181,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`❌ قطع: ${socket.id}`);
+    log('INFO', `❌ قطع`, { socketId: socket.id, userName: socket.userName });
+
+    // 👀 إزالة المشاهد
+    if (socket.isSpectator && socket.spectateRoomId) {
+      removeSpectator(socket, socket.spectateRoomId);
+    }
+
     if (socket.userName) {
       onlineUsers.delete(socket.userName);
     }
@@ -880,22 +1213,20 @@ function handlePlayerLeave(socket, roomId) {
     message: "أحد اللاعبين غادر",
   });
 
-  socket.to(roomId).emit('voice_user_left', {
-    playerId: socket.id,
-  });
+  socket.to(roomId).emit('voice_user_left', { playerId: socket.id });
 
   const player = game.players.find(p => p.id === socket.id);
-  
+
   if (player && game.players.filter(p => p.connected).length > 0) {
-    console.log(`⏱️ جدولة AI Fallback لـ ${player.name}`);
-    
+    log('INFO', `⏱️ جدولة AI Fallback`, { roomId, playerName: player.name });
+
     player.aiTakeoverTimer = setTimeout(() => {
       const currentGame = rooms.get(roomId);
       if (!currentGame) return;
-      
+
       const currentPlayer = currentGame.players.find(p => p.id === socket.id);
       if (!currentPlayer || currentPlayer.connected) return;
-      
+
       startAIFallback(roomId, socket.id);
     }, AI_TAKEOVER_DELAY);
   }
@@ -907,26 +1238,26 @@ function handlePlayerLeave(socket, roomId) {
 }
 
 // =========================================
-// تشغيل الخادم
+// تشغيل
 // =========================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v5.5 (Yalla Ludo) ║
+  ║   🎲 Domino Server v8.0              ║
   ║   Port: ${PORT}                          ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
-  ║   OTA: ${OTA_ENABLED ? '✅' : '⏸️'}                        ║
+  ║   Supabase: ${supabaseReady ? '✅' : '⚠️'}                      ║
+  ║   Agora: ${AGORA_APP_ID ? '✅' : '⚠️'}                         ║
+  ║   Spectator: ✅                       ║
   ║   AI Fallback: ✅                     ║
-  ║   Agora Voice: ✅                     ║
-  ║   Friends & Invites: ✅               ║
   ╚═══════════════════════════════════════╝
   `);
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ خطأ:', err);
+  log('ERROR', 'خطأ غير متوقع', { error: err.message });
 });
 process.on('unhandledRejection', (err) => {
-  console.error('❌ رفض:', err);
+  log('ERROR', 'رفض غير معالج', { error: err.message });
 });
