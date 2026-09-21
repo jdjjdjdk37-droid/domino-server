@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v8.0
-// Yalla Ludo Style + Supabase + Spectator + Agora
+// خادم لعبة الدومينو - Railway Ready v9.0
+// Room Code 5 Digits + Friend Chat + Invitations
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -40,8 +40,6 @@ try {
     });
     supabaseReady = true;
     console.log('✅ Supabase Admin جاهز');
-  } else {
-    console.log('⚠️ Supabase غير مُهيأ');
   }
 } catch (err) {
   console.error('⚠️ Supabase معطّل:', err.message);
@@ -76,7 +74,6 @@ try {
   console.error('⚠️ Firebase معطّل:', err.message);
 }
 
-// استيراد منطق اللعبة
 const { DominoGame } = require('./dominoGameLogic');
 
 // =========================================
@@ -115,12 +112,11 @@ app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 const rooms = new Map();
 const playerRooms = new Map();
 const onlineUsers = new Map();
-const spectators = new Map(); // roomId → [{id, name}]
+const spectators = new Map();
 
 const MAX_SPECTATORS_PER_ROOM = 50;
 const AI_TAKEOVER_DELAY = 30000;
 const TURN_TIMEOUT = 30000;
-const CHAT_TTL_HOURS = 24;
 
 // =========================================
 // Logging
@@ -132,17 +128,31 @@ function log(level, message, data = {}) {
 }
 
 // =========================================
+// 🆕 توليد رمز الغرفة — 5 أرقام فقط
+// =========================================
+function generateRoomCode() {
+  let roomId;
+  let attempts = 0;
+  do {
+    roomId = Math.floor(10000 + Math.random() * 90000).toString();
+    attempts++;
+    if (attempts > 100) break;
+  } while (rooms.has(roomId));
+  return roomId;
+}
+
+// =========================================
 // OTA
 // =========================================
 const OTA_ENABLED = false;
 
 const LATEST_VERSION = {
-  versionCode: 5,
-  versionName: "2.5.0",
-  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.5.0.apk`,
-  changelog: "🎉 جديد:\n• نظام Spectator (مشاهدة المباريات)\n• Supabase Storage للأفاتار\n• Live Matches\n• المزيد",
+  versionCode: 6,
+  versionName: "2.6.0",
+  apkUrl: `${process.env.PUBLIC_URL || 'https://domino-server-production-e9af.up.railway.app'}/downloads/domino-v2.6.0.apk`,
+  changelog: "🎉 جديد:\n• رمز الغرفة 5 أرقام\n• دعوات فورية\n• دردشة الأصدقاء\n• رسائل صوتية",
   isMandatory: false,
-  releaseDate: "2026-09-20",
+  releaseDate: "2026-09-21",
   minSupportedVersion: 1,
 };
 
@@ -152,7 +162,6 @@ const LATEST_VERSION = {
 app.post('/api/agora/token', (req, res) => {
   try {
     const { roomId, uid } = req.body;
-
     if (!roomId || !uid) {
       return res.status(400).json({ error: "roomId و uid مطلوبان" });
     }
@@ -165,8 +174,6 @@ app.post('/api/agora/token', (req, res) => {
       RtcRole.PUBLISHER,
       Math.floor(Date.now() / 1000) + 3600
     );
-
-    log('INFO', '🎤 Token Agora', { roomId, uid });
 
     res.json({
       token,
@@ -186,20 +193,12 @@ app.post('/api/agora/token', (req, res) => {
 app.post('/api/supabase/upload-url', (req, res) => {
   try {
     const { userId, fileType } = req.body;
-
-    if (!userId) {
-      return res.status(400).json({ error: "userId مطلوب" });
-    }
-
-    if (!supabaseReady) {
-      return res.status(503).json({ error: "Supabase غير متصل" });
-    }
+    if (!userId) return res.status(400).json({ error: "userId مطلوب" });
+    if (!supabaseReady) return res.status(503).json({ error: "Supabase غير متصل" });
 
     const ext = fileType || 'jpg';
     const fileName = `${userId}_${Date.now()}.${ext}`;
     const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${fileName}`;
-
-    log('INFO', '☁️ Upload URL', { userId, fileName });
 
     res.json({
       fileName,
@@ -208,8 +207,46 @@ app.post('/api/supabase/upload-url', (req, res) => {
       uploadUrl: `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${fileName}`,
     });
   } catch (err) {
-    log('ERROR', 'فشل إنشاء URL', { error: err.message });
     res.status(500).json({ error: "فشل إنشاء URL" });
+  }
+});
+
+// =========================================
+// 📩 جلب رسائل الأصدقاء
+// =========================================
+app.get('/api/messages/:user1/:user2', async (req, res) => {
+  try {
+    const { user1, user2 } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+
+    if (!firebaseReady) {
+      return res.status(503).json({ error: "Firebase غير متصل" });
+    }
+
+    const snapshot = await db.collection('private_messages')
+      .orderBy('timestamp', 'desc')
+      .limit(200)
+      .get();
+
+    const messages = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      const isBetween = 
+        (data.fromUser === user1 && data.toUser === user2) ||
+        (data.fromUser === user2 && data.toUser === user1);
+      
+      if (isBetween && messages.length < limit) {
+        messages.push({
+          id: doc.id,
+          ...data,
+          timestamp: data.timestamp?.toDate?.()?.toISOString() || data.timestamp,
+        });
+      }
+    });
+
+    res.json({ messages: messages.reverse(), count: messages.length });
+  } catch (err) {
+    res.status(500).json({ error: "فشل جلب الرسائل" });
   }
 });
 
@@ -287,7 +324,6 @@ app.get('/api/user/:userId/stats', async (req, res) => {
       achievements: data.achievements || [],
     });
   } catch (err) {
-    log('ERROR', 'فشل جلب الإحصائيات', { error: err.message });
     res.status(500).json({ error: "فشل جلب الإحصائيات" });
   }
 });
@@ -354,7 +390,7 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
     if (p.aiTakeoverTimer) clearTimeout(p.aiTakeoverTimer);
   });
 
-  // 👀 إشعار المشاهدين
+  // إشعار المشاهدين
   const specList = spectators.get(roomId) || [];
   specList.forEach(s => {
     io.to(s.id).emit('spectator_game_ended', {
@@ -364,20 +400,12 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
   });
   spectators.delete(roomId);
 
-  io.to(roomId).emit('room_closed', {
-    roomId,
-    reason,
-    message: reason,
-  });
+  io.to(roomId).emit('room_closed', { roomId, reason, message: reason });
 
-  game.players.forEach(p => {
-    playerRooms.delete(p.id);
-  });
+  game.players.forEach(p => playerRooms.delete(p.id));
 
   io.sockets.sockets.forEach(socket => {
-    if (socket.rooms.has(roomId)) {
-      socket.leave(roomId);
-    }
+    if (socket.rooms.has(roomId)) socket.leave(roomId);
   });
 
   rooms.delete(roomId);
@@ -399,17 +427,14 @@ setInterval(() => {
       closeRoom(roomId, "🏆 انتهت اللعبة");
       return;
     }
-
     if (now - lastActivity > MAX_IDLE_TIME) {
       closeRoom(roomId, "⏱️ انتهت مدة الانتظار");
       return;
     }
-
     if (now - game.createdAt > MAX_GAME_AGE) {
       closeRoom(roomId, "⌛ الغرفة قديمة");
       return;
     }
-
     const connectedPlayers = game.players.filter(p => p.connected);
     if (connectedPlayers.length === 0 && game.players.length > 0) {
       closeRoom(roomId, "👋 غادر جميع اللاعبين");
@@ -422,26 +447,25 @@ setInterval(() => {
 // =========================================
 app.get('/', (req, res) => {
   res.json({
-    name: "🎲 Domino Server - Yalla Ludo Style",
+    name: "🎲 Domino Server",
     status: "online",
-    version: "8.0.0",
+    version: "9.0.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     onlineUsers: onlineUsers.size,
     spectators: spectators.size,
     uptime: Math.floor(process.uptime()) + "s",
     otaEnabled: OTA_ENABLED,
-    firebaseReady: firebaseReady,
-    supabaseReady: supabaseReady,
+    firebaseReady,
+    supabaseReady,
     agoraEnabled: !!(AGORA_APP_ID && AGORA_APP_CERTIFICATE),
-    aiFallbackEnabled: true,
   });
 });
 
 app.get('/health', async (req, res) => {
   const start = Date.now();
-
   let firebaseStatus = 'disconnected';
+
   if (firebaseReady) {
     try {
       await db.collection('_health').limit(1).get();
@@ -468,7 +492,7 @@ app.get('/health', async (req, res) => {
       memory: Math.round(memory.heapUsed / 1024 / 1024) + "MB",
       uptime: Math.floor(process.uptime()) + "s",
     },
-    version: "8.0.0",
+    version: "9.0.0",
   });
 });
 
@@ -501,10 +525,12 @@ app.get('/api/config', (req, res) => {
       aiTakeover: true,
       avatars: true,
       chat: true,
+      privateChat: true,
       leaderboard: true,
       friendInvites: true,
       spectator: true,
       supabaseUploads: supabaseReady,
+      roomCodeDigits: 5,
     },
     agora: {
       appId: AGORA_APP_ID,
@@ -514,6 +540,7 @@ app.get('/api/config', (req, res) => {
       turnTimeout: 30,
       aiTakeoverDelay: 30,
       roomIdleTimeout: 600,
+      inviteTimeout: 30,
     },
     version: {
       latest: LATEST_VERSION.versionName,
@@ -527,14 +554,11 @@ app.get('/api/config', (req, res) => {
 // =========================================
 app.get('/api/check-update', (req, res) => {
   if (!OTA_ENABLED) {
-    return res.json({
-      updateAvailable: false,
-      message: "لا يوجد تحديث حالياً",
-    });
+    return res.json({ updateAvailable: false, message: "لا يوجد تحديث حالياً" });
   }
 
   const clientVersion = parseInt(req.query.versionCode) || 0;
-  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.5.0.apk');
+  const apkPath = path.join(__dirname, 'public/downloads/domino-v2.6.0.apk');
 
   if (!fs.existsSync(apkPath)) {
     return res.json({ updateAvailable: false });
@@ -643,9 +667,9 @@ function getAIMove(game, player) {
   if (validMoves.length === 0) return null;
 
   validMoves.sort((a, b) => {
-    const aDouble = a.tile.left === a.tile.right ? 1 : 0;
-    const bDouble = b.tile.left === b.tile.right ? 1 : 0;
-    if (aDouble !== bDouble) return bDouble - aDouble;
+    const aD = a.tile.left === a.tile.right ? 1 : 0;
+    const bD = b.tile.left === b.tile.right ? 1 : 0;
+    if (aD !== bD) return bD - aD;
     return (b.tile.left + b.tile.right) - (a.tile.left + a.tile.right);
   });
 
@@ -659,9 +683,7 @@ function startAIFallback(roomId, playerId) {
   const player = game.players.find(p => p.id === playerId);
   if (!player) return;
 
-  log('INFO', `🤖 AI يبدأ`, { roomId, playerName: player.name });
   player.aiControlled = true;
-
   io.to(roomId).emit('ai_took_over', {
     playerId,
     playerName: player.name,
@@ -707,6 +729,7 @@ function makeAIMove(roomId, playerId) {
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
+      socket?.to?.(roomId)?.emit?.('game_state', game.getPublicState(null));
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
@@ -722,7 +745,6 @@ function makeAIMove(roomId, playerId) {
         return;
       }
     }
-
     const passResult = game.passTurn(playerId);
     if (!passResult.error) {
       game.players.forEach(p => {
@@ -782,11 +804,8 @@ function removeSpectator(socket, roomId) {
 
   if (idx !== -1) list.splice(idx, 1);
 
-  if (list.length === 0) {
-    spectators.delete(roomId);
-  } else {
-    spectators.set(roomId, list);
-  }
+  if (list.length === 0) spectators.delete(roomId);
+  else spectators.set(roomId, list);
 
   socket.leave(roomId);
   socket.isSpectator = false;
@@ -796,8 +815,6 @@ function removeSpectator(socket, roomId) {
     spectatorId: socket.id,
     totalSpectators: list.length,
   });
-
-  log('INFO', `👀 مشاهد غادر`, { roomId, total: list.length });
 }
 
 // =========================================
@@ -807,37 +824,143 @@ io.on('connection', (socket) => {
   log('INFO', `✅ لاعب متصل`, { socketId: socket.id });
 
   // تسجيل اللاعب
-  socket.on('user_online', ({ userName }) => {
+  socket.on('user_online', ({ userName, userAvatar }) => {
     if (userName) {
       onlineUsers.set(userName, socket.id);
       socket.userName = userName;
+      socket.userAvatar = userAvatar || null;
       log('INFO', `👤 تسجيل دخول`, { userName });
     }
   });
 
-  // دعوة صديق
+  // =========================================
+  // 🎮 دعوات اللعب
+  // =========================================
   socket.on('invite_friend', ({ targetUserName, roomId, mode }) => {
     const targetSocketId = onlineUsers.get(targetUserName);
+
     if (targetSocketId) {
+      // إرسال الدعوة للمستقبل
       io.to(targetSocketId).emit('receive_room_invite', {
         fromUser: socket.userName || "صديق",
+        fromUserId: socket.id,
+        fromUserAvatar: socket.userAvatar || null,
         roomId,
         mode,
         timestamp: Date.now(),
       });
+
+      // تأكيد للمرسل
+      socket.emit('invite_sent', {
+        targetUser: targetUserName,
+        roomId,
+        mode,
+        timestamp: Date.now(),
+      });
+
+      log('INFO', `📩 دعوة أُرسلت`, { from: socket.userName, to: targetUserName });
     } else {
-      socket.emit('invite_failed', { message: "الصديق غير متصل حالياً" });
+      socket.emit('invite_failed', {
+        message: "الصديق غير متصل حالياً",
+        targetUser: targetUserName,
+      });
     }
   });
 
-  // الرد على الدعوة
   socket.on('respond_invite', ({ roomId, accept, inviterName }) => {
     const inviterSocketId = onlineUsers.get(inviterName);
+
     if (inviterSocketId) {
       io.to(inviterSocketId).emit('invite_response', {
         fromUser: socket.userName,
         accept,
         roomId,
+        timestamp: Date.now(),
+      });
+
+      if (accept) {
+        io.to(inviterSocketId).emit('invite_accepted', {
+          fromUser: socket.userName,
+          roomId,
+        });
+      } else {
+        io.to(inviterSocketId).emit('invite_rejected', {
+          fromUser: socket.userName,
+          roomId,
+        });
+      }
+    }
+  });
+
+  // =========================================
+  // 💬 رسائل الأصدقاء الخاصة
+  // =========================================
+  socket.on('send_private_message', async ({ toUserName, text, messageType = "text" }) => {
+    const toSocketId = onlineUsers.get(toUserName);
+
+    const message = {
+      fromUser: socket.userName || "مجهول",
+      fromUserId: socket.id,
+      fromUserAvatar: socket.userAvatar || null,
+      toUser: toUserName,
+      text: (text || "").substring(0, 500),
+      messageType,
+      timestamp: Date.now(),
+      read: false,
+    };
+
+    // إرسال للمستقبل
+    if (toSocketId) {
+      io.to(toSocketId).emit('new_private_message', message);
+    }
+
+    // تأكيد للمرسل
+    socket.emit('message_sent', {
+      messageId: Date.now().toString(),
+      ...message,
+    });
+
+    // حفظ في Firestore
+    if (firebaseReady) {
+      try {
+        await db.collection('private_messages').add({
+          ...message,
+          timestamp: new Date(message.timestamp),
+        });
+      } catch (err) {
+        log('ERROR', 'حفظ رسالة خاصة', { error: err.message });
+      }
+    }
+  });
+
+  socket.on('mark_messages_read', async ({ withUserName }) => {
+    if (!firebaseReady) return;
+
+    try {
+      const snapshot = await db.collection('private_messages')
+        .where('fromUser', '==', withUserName)
+        .where('toUser', '==', socket.userName)
+        .where('read', '==', false)
+        .get();
+
+      const batch = db.batch();
+      snapshot.docs.forEach(doc => {
+        batch.update(doc.ref, { read: true });
+      });
+
+      await batch.commit();
+
+      socket.emit('messages_marked_read', { count: snapshot.size });
+    } catch (err) {
+      log('ERROR', 'تحديث الرسائل', { error: err.message });
+    }
+  });
+
+  socket.on('typing', ({ toUserName }) => {
+    const toSocketId = onlineUsers.get(toUserName);
+    if (toSocketId) {
+      io.to(toSocketId).emit('user_typing', {
+        fromUser: socket.userName,
       });
     }
   });
@@ -866,8 +989,6 @@ io.on('connection', (socket) => {
       currentSpecs.push({ id: socket.id, name: spectatorName });
       spectators.set(roomId, currentSpecs);
 
-      log('INFO', `👀 مشاهد انضم`, { roomId, name: spectatorName, total: currentSpecs.length });
-
       socket.emit('game_state', game.getPublicState(null));
 
       io.to(roomId).emit('spectator_joined', {
@@ -878,14 +999,12 @@ io.on('connection', (socket) => {
 
       callback?.({ success: true, totalSpectators: currentSpecs.length });
     } catch (err) {
-      log('ERROR', 'فشل انضمام المشاهد', { error: err.message });
       callback?.({ error: "فشل الانضمام" });
     }
   });
 
   socket.on('spectator_message', ({ roomId, text }) => {
-    if (!socket.isSpectator) return;
-    if (socket.spectateRoomId !== roomId) return;
+    if (!socket.isSpectator || socket.spectateRoomId !== roomId) return;
 
     io.to(roomId).emit('spectator_message', {
       spectatorId: socket.id,
@@ -896,8 +1015,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('spectator_emoji', ({ roomId, emoji }) => {
-    if (!socket.isSpectator) return;
-    if (socket.spectateRoomId !== roomId) return;
+    if (!socket.isSpectator || socket.spectateRoomId !== roomId) return;
 
     io.to(roomId).emit('spectator_emoji', {
       spectatorId: socket.id,
@@ -916,7 +1034,8 @@ io.on('connection', (socket) => {
   // =========================================
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
-      const roomId = uuidv4().slice(0, 6).toUpperCase();
+      // 🆕 رمز مكوّن من 5 أرقام فقط
+      const roomId = generateRoomCode();
       const game = new DominoGame(roomId, mode, socket.id, playerName);
       game.lastActivity = Date.now();
 
@@ -938,7 +1057,12 @@ io.on('connection', (socket) => {
 
   socket.on('join_room', ({ roomId, playerName }, callback) => {
     try {
-      const game = rooms.get(roomId.toUpperCase());
+      // التحقق أن الرمز أرقام فقط
+      if (!/^\d{5}$/.test(roomId)) {
+        return callback({ error: "رمز الغرفة يجب أن يكون 5 أرقام" });
+      }
+
+      const game = rooms.get(roomId);
       if (!game) return callback({ error: "الغرفة غير موجودة" });
       if (game.isFull()) return callback({ error: "الغرفة ممتلئة" });
 
@@ -983,19 +1107,15 @@ io.on('connection', (socket) => {
       const result = game.playTile(socket.id, tile, side);
       if (result.error) return callback?.({ error: result.error });
 
-      // إرسال للاعبين
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
 
-      // 👀 إرسال للمشاهدين
       socket.to(roomId).emit('game_state', game.getPublicState(null));
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
-        if (game.gameStatus === "finished") {
-          handleGameEnd(roomId);
-        }
+        if (game.gameStatus === "finished") handleGameEnd(roomId);
       } else {
         const nextPlayer = game.players[game.currentTurn];
         if (nextPlayer?.aiControlled) {
@@ -1047,9 +1167,7 @@ io.on('connection', (socket) => {
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
-        if (game.gameStatus === "finished") {
-          handleGameEnd(roomId);
-        }
+        if (game.gameStatus === "finished") handleGameEnd(roomId);
       } else {
         const nextPlayer = game.players[game.currentTurn];
         if (nextPlayer?.aiControlled) {
@@ -1081,7 +1199,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // الدردشة
+  // الدردشة داخل الغرفة
   socket.on('send_message', async ({ roomId, text, type = "text" }) => {
     const game = rooms.get(roomId);
     if (!game) return;
@@ -1099,7 +1217,6 @@ io.on('connection', (socket) => {
 
     io.to(roomId).emit('chat_message', message);
 
-    // حفظ في Firestore
     if (firebaseReady) {
       try {
         await db.collection('chat_messages').add({
@@ -1183,7 +1300,6 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     log('INFO', `❌ قطع`, { socketId: socket.id, userName: socket.userName });
 
-    // 👀 إزالة المشاهد
     if (socket.isSpectator && socket.spectateRoomId) {
       removeSpectator(socket, socket.spectateRoomId);
     }
@@ -1191,6 +1307,7 @@ io.on('connection', (socket) => {
     if (socket.userName) {
       onlineUsers.delete(socket.userName);
     }
+
     const roomId = playerRooms.get(socket.id);
     if (roomId) handlePlayerLeave(socket, roomId);
   });
@@ -1218,8 +1335,6 @@ function handlePlayerLeave(socket, roomId) {
   const player = game.players.find(p => p.id === socket.id);
 
   if (player && game.players.filter(p => p.connected).length > 0) {
-    log('INFO', `⏱️ جدولة AI Fallback`, { roomId, playerName: player.name });
-
     player.aiTakeoverTimer = setTimeout(() => {
       const currentGame = rooms.get(roomId);
       if (!currentGame) return;
@@ -1244,13 +1359,14 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v8.0              ║
+  ║   🎲 Domino Server v9.0              ║
   ║   Port: ${PORT}                          ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
   ║   Supabase: ${supabaseReady ? '✅' : '⚠️'}                      ║
   ║   Agora: ${AGORA_APP_ID ? '✅' : '⚠️'}                         ║
-  ║   Spectator: ✅                       ║
-  ║   AI Fallback: ✅                     ║
+  ║   Room Code: 5 أرقام                 ║
+  ║   Friend Chat: ✅                     ║
+  ║   Invitations: ✅                     ║
   ╚═══════════════════════════════════════╝
   `);
 });
