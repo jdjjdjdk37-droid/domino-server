@@ -1,7 +1,7 @@
 {
   "name": "domino-server",
-  "version": "9.0.0",
-  "description": "خادم لعبة الدومينو - v9.0",
+  "version": "9.1.0",
+  "description": "خادم لعبة الدومينو - v9.1",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
