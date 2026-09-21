@@ -1,6 +1,6 @@
 // ==============================================
-// خادم لعبة الدومينو - Railway Ready v9.0
-// Room Code 5 Digits + Friend Chat + Invitations
+// خادم لعبة الدومينو - Railway Ready v9.1
+// Room Code 5 Digits + Friend Chat + Supabase Fix
 // ==============================================
 require('dotenv').config();
 const express = require('express');
@@ -14,6 +14,7 @@ const path = require('path');
 const fs = require('fs');
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token');
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 
 // =========================================
 // Agora Configuration
@@ -24,7 +25,7 @@ const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || "f245fe7746ff
 console.log(`🎤 Agora App ID: ${AGORA_APP_ID.substring(0, 8)}...`);
 
 // =========================================
-// Supabase Configuration
+// Supabase Configuration (with WebSocket)
 // =========================================
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
@@ -36,10 +37,19 @@ let supabaseReady = false;
 try {
   if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
     supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
-      auth: { persistSession: false }
+      auth: { persistSession: false },
+      realtime: {
+        transport: WebSocket,
+      },
     });
     supabaseReady = true;
     console.log('✅ Supabase Admin جاهز');
+    console.log(`   URL: ${SUPABASE_URL}`);
+    console.log(`   Bucket: ${SUPABASE_BUCKET}`);
+  } else {
+    console.log('⚠️ Supabase: متغيرات ناقصة');
+    console.log(`   URL موجود: ${!!SUPABASE_URL}`);
+    console.log(`   KEY موجود: ${!!SUPABASE_SECRET_KEY}`);
   }
 } catch (err) {
   console.error('⚠️ Supabase معطّل:', err.message);
@@ -390,7 +400,6 @@ function closeRoom(roomId, reason = "انتهت اللعبة") {
     if (p.aiTakeoverTimer) clearTimeout(p.aiTakeoverTimer);
   });
 
-  // إشعار المشاهدين
   const specList = spectators.get(roomId) || [];
   specList.forEach(s => {
     io.to(s.id).emit('spectator_game_ended', {
@@ -449,7 +458,7 @@ app.get('/', (req, res) => {
   res.json({
     name: "🎲 Domino Server",
     status: "online",
-    version: "9.0.0",
+    version: "9.1.0",
     activeRooms: rooms.size,
     activePlayers: playerRooms.size,
     onlineUsers: onlineUsers.size,
@@ -492,7 +501,7 @@ app.get('/health', async (req, res) => {
       memory: Math.round(memory.heapUsed / 1024 / 1024) + "MB",
       uptime: Math.floor(process.uptime()) + "s",
     },
-    version: "9.0.0",
+    version: "9.1.0",
   });
 });
 
@@ -729,7 +738,6 @@ function makeAIMove(roomId, playerId) {
       game.players.forEach(p => {
         io.to(p.id).emit('game_state', game.getPublicState(p.id));
       });
-      socket?.to?.(roomId)?.emit?.('game_state', game.getPublicState(null));
 
       if (result.gameEnded) {
         io.to(roomId).emit('round_ended', game.lastAction);
@@ -840,7 +848,6 @@ io.on('connection', (socket) => {
     const targetSocketId = onlineUsers.get(targetUserName);
 
     if (targetSocketId) {
-      // إرسال الدعوة للمستقبل
       io.to(targetSocketId).emit('receive_room_invite', {
         fromUser: socket.userName || "صديق",
         fromUserId: socket.id,
@@ -850,7 +857,6 @@ io.on('connection', (socket) => {
         timestamp: Date.now(),
       });
 
-      // تأكيد للمرسل
       socket.emit('invite_sent', {
         targetUser: targetUserName,
         roomId,
@@ -909,18 +915,15 @@ io.on('connection', (socket) => {
       read: false,
     };
 
-    // إرسال للمستقبل
     if (toSocketId) {
       io.to(toSocketId).emit('new_private_message', message);
     }
 
-    // تأكيد للمرسل
     socket.emit('message_sent', {
       messageId: Date.now().toString(),
       ...message,
     });
 
-    // حفظ في Firestore
     if (firebaseReady) {
       try {
         await db.collection('private_messages').add({
@@ -1034,7 +1037,6 @@ io.on('connection', (socket) => {
   // =========================================
   socket.on('create_room', ({ playerName, mode = "1v1" }, callback) => {
     try {
-      // 🆕 رمز مكوّن من 5 أرقام فقط
       const roomId = generateRoomCode();
       const game = new DominoGame(roomId, mode, socket.id, playerName);
       game.lastActivity = Date.now();
@@ -1057,7 +1059,6 @@ io.on('connection', (socket) => {
 
   socket.on('join_room', ({ roomId, playerName }, callback) => {
     try {
-      // التحقق أن الرمز أرقام فقط
       if (!/^\d{5}$/.test(roomId)) {
         return callback({ error: "رمز الغرفة يجب أن يكون 5 أرقام" });
       }
@@ -1359,11 +1360,12 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║   🎲 Domino Server v9.0              ║
+  ║   🎲 Domino Server v9.1              ║
   ║   Port: ${PORT}                          ║
   ║   Firebase: ${firebaseReady ? '✅' : '⚠️'}                      ║
   ║   Supabase: ${supabaseReady ? '✅' : '⚠️'}                      ║
   ║   Agora: ${AGORA_APP_ID ? '✅' : '⚠️'}                         ║
+  ║   WebSocket: ✅ (ws)                   ║
   ║   Room Code: 5 أرقام                 ║
   ║   Friend Chat: ✅                     ║
   ║   Invitations: ✅                     ║
